@@ -60,9 +60,11 @@ Pi0 한 줄 요약
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import math
 from typing import Optional
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
@@ -176,6 +178,123 @@ def preprocess_observation(obs: Observation, image_resolution=IMAGE_RESOLUTION) 
         state=obs.state,
         tokenized_prompt=obs.tokenized_prompt,
         tokenized_prompt_mask=obs.tokenized_prompt_mask,
+    )
+
+
+# =====================================================================================
+# 1b. Tokenizer (텍스트 task/prompt -> 토큰 id)
+# =====================================================================================
+#
+# 모델은 입력으로 "이미 정수 토큰화된" tokenized_prompt 를 받는다(embed_prefix 가 그걸
+# 임베딩 테이블로 룩업). 그래서 "빨간 컵을 집어" 같은 raw 텍스트가 주어지면, 먼저 토큰
+# id 시퀀스로 바꿔야 한다. 그 일을 하는 게 Pi0Tokenizer 이다. (openpi PaligemmaTokenizer 와
+# 동일한 포맷)
+#
+# 두 가지 포맷:
+#   - pi0  : "<task 텍스트>" + "\n"(=답 시작 토큰) 을 토큰화. state 는 토큰화 안 함
+#            (state 는 suffix 의 연속 토큰으로 따로 들어감).
+#   - pi05 : "Task: <task>, State: <state 를 256단계로 이산화한 숫자열>;\nAction: " 를 통째로
+#            토큰화. 즉 state 가 prefix 의 "텍스트"로 들어간다.
+#
+# 실제 PaliGemma 토큰화는 SentencePiece 모델(gs://big_vision/paligemma_tokenizer.model)이
+# 필요하다. 모델 경로를 주면 그걸 쓰고, 없으면 외부 의존성 없이 도는 디버그용 stub 인코더를
+# 쓴다(토큰 id 가 진짜 PaliGemma 와 다르므로 실제 학습/체크포인트엔 반드시 진짜 모델 사용).
+
+_BOS_ID = 2  # PaliGemma begin-of-sentence
+_NEWLINE_ID = 108  # stub 에서 "\n"(답 시작) 토큰으로 쓸 고정 id
+
+
+def _stub_encode(text: str, add_bos: bool = False) -> list[int]:
+    """의존성 없는 디버그용 인코더: 공백 단위로 쪼개 각 단어를 해시로 vocab 범위에 매핑.
+
+    실제 subword 토큰화가 아니라 단어->id 해시일 뿐이다. 파이프라인(텍스트->id->임베딩)을
+    end-to-end 로 돌려보기 위한 placeholder. 진짜 PaliGemma 토큰화는 sp_model_path 를 줄 것.
+    """
+    if text == "\n":
+        return [_NEWLINE_ID]
+    ids: list[int] = [_BOS_ID] if add_bos else []
+    for word in text.split():
+        h = int(hashlib.md5(word.encode("utf-8")).hexdigest(), 16)
+        ids.append(3 + h % (PALIGEMMA_VOCAB_SIZE - 3))  # 0~2 는 특수토큰으로 비워둠
+    return ids
+
+
+class Pi0Tokenizer:
+    """raw 텍스트(+state) -> (tokenized_prompt, tokenized_prompt_mask). openpi 포맷 동일.
+
+    한 번에 "한 예시" 를 처리한다(데이터 transform 이 배치 전 단계에서 예시별로 도는 것과 동일).
+    배치는 tokenize_batch 로.
+    """
+
+    def __init__(self, max_len: int, pi05: bool = False, sp_model_path: Optional[str] = None):
+        self.max_len = max_len
+        self.pi05 = pi05
+        if sp_model_path is not None:
+            import sentencepiece  # noqa: PLC0415  (선택적 의존성)
+
+            sp = sentencepiece.SentencePieceProcessor(model_file=str(sp_model_path))
+            self._encode = lambda s, add_bos=False: sp.encode(s, add_bos=add_bos)
+            self.backend = "paligemma-sentencepiece"
+        else:
+            self._encode = _stub_encode
+            self.backend = "stub (DEBUG 전용 — 실제 학습엔 PaliGemma SentencePiece 모델 필요)"
+
+    def tokenize(self, prompt: str, state: Optional[np.ndarray] = None) -> tuple[np.ndarray, np.ndarray]:
+        """prompt(str) [+ state(Ad,)] -> tokens [max_len], mask [max_len]."""
+        cleaned = prompt.strip().replace("_", " ").replace("\n", " ")
+        if self.pi05:
+            if state is None:
+                raise ValueError("pi05 는 state 를 프롬프트에 넣으므로 state 가 필요하다.")
+            # state 를 256 구간으로 이산화 (정규화 범위 [-1,1] 가정). openpi 와 동일.
+            disc = np.digitize(np.asarray(state), bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+            state_str = " ".join(map(str, disc.tolist()))
+            full_prompt = f"Task: {cleaned}, State: {state_str};\nAction: "
+            tokens = self._encode(full_prompt, add_bos=True)
+        else:
+            # task 텍스트 + "\n"(답 시작 토큰). state 는 토큰화하지 않음.
+            tokens = self._encode(cleaned, add_bos=True) + self._encode("\n")
+
+        n = len(tokens)
+        if n < self.max_len:
+            mask = [True] * n + [False] * (self.max_len - n)
+            tokens = tokens + [0] * (self.max_len - n)  # 0 = padding id
+        else:
+            tokens = tokens[: self.max_len]
+            mask = [True] * self.max_len
+        return np.asarray(tokens, dtype=np.int64), np.asarray(mask, dtype=bool)
+
+    def tokenize_batch(self, prompts, states=None, device="cpu") -> tuple[Tensor, Tensor]:
+        """prompts: list[str] (길이 B), states: [B, Ad] tensor 또는 None.
+        반환: tokenized_prompt [B, max_len] int64, mask [B, max_len] bool.
+        """
+        toks, masks = [], []
+        for i, p in enumerate(prompts):
+            s = None
+            if states is not None:
+                s = states[i].detach().cpu().numpy()
+            t, m = self.tokenize(p, s)
+            toks.append(t)
+            masks.append(m)
+        return (
+            torch.as_tensor(np.stack(toks), device=device),
+            torch.as_tensor(np.stack(masks), device=device),
+        )
+
+
+def build_observation(images, state, prompt, tokenizer: Pi0Tokenizer, image_masks=None) -> Observation:
+    """raw 입력(이미지 + state + 텍스트 prompt) -> Observation. 텍스트를 토큰화해 채워준다.
+
+    images : {camera: [B,3,H,W]} , state : [B, Ad] , prompt : str 또는 list[str](길이 B).
+    pi05 면 state 가 프롬프트(텍스트)로도 들어가고, 모델 suffix 에서는 무시된다.
+    """
+    B = state.shape[0]
+    prompts = [prompt] * B if isinstance(prompt, str) else list(prompt)
+    # pi05 만 state 를 프롬프트에 넣는다.
+    tok, mask = tokenizer.tokenize_batch(prompts, state if tokenizer.pi05 else None, device=state.device)
+    if image_masks is None:
+        image_masks = {k: torch.ones(B, dtype=torch.bool, device=state.device) for k in images}
+    return Observation(
+        images=images, image_masks=image_masks, state=state, tokenized_prompt=tok, tokenized_prompt_mask=mask
     )
 
 
@@ -881,20 +1000,19 @@ if __name__ == "__main__":
     model.eval()
 
     B = 2
-    obs = Observation(
-        images={
-            "base_0_rgb": torch.randn(B, 3, 224, 224),
-            "left_wrist_0_rgb": torch.randn(B, 3, 224, 224),
-        },
-        image_masks={
-            "base_0_rgb": torch.ones(B, dtype=torch.bool),
-            "left_wrist_0_rgb": torch.ones(B, dtype=torch.bool),
-        },
-        state=torch.randn(B, cfg.action_dim),
-        tokenized_prompt=torch.randint(0, 1000, (B, cfg.max_token_len)),
-        tokenized_prompt_mask=torch.ones(B, cfg.max_token_len, dtype=torch.bool),
-    )
+    images = {
+        "base_0_rgb": torch.randn(B, 3, 224, 224),
+        "left_wrist_0_rgb": torch.randn(B, 3, 224, 224),
+    }
+    state = torch.randn(B, cfg.action_dim).clamp(-1, 1)
     actions = torch.randn(B, cfg.action_horizon, cfg.action_dim)
+
+    # --- raw 텍스트 task -> 토크나이저 -> Observation (새로 추가한 경로) ---
+    tok = Pi0Tokenizer(max_len=cfg.max_token_len, pi05=cfg.pi05)  # sp_model_path 주면 진짜 PaliGemma
+    print("tokenizer backend:", tok.backend)
+    prompts = ["pick up the red cup", "open the drawer"]
+    obs = build_observation(images, state, prompts, tok)
+    print("tokenized_prompt:", tuple(obs.tokenized_prompt.shape), "| mask sum:", obs.tokenized_prompt_mask.sum().item())
 
     loss = model.compute_loss(obs, actions)
     print("loss shape:", tuple(loss.shape), "| mean:", loss.mean().item())
@@ -902,11 +1020,13 @@ if __name__ == "__main__":
     sampled = model.sample_actions(obs, num_steps=5)
     print("sampled actions shape:", tuple(sampled.shape))
 
-    # pi05 변형도 확인.
-    cfg05 = dataclasses.replace(cfg, pi05=True, max_token_len=6)
+    # pi05 변형: state 가 프롬프트(텍스트)로 들어간다.
+    cfg05 = dataclasses.replace(cfg, pi05=True, max_token_len=64)
     model05 = Pi0(cfg05).eval()
-    loss05 = model05.compute_loss(obs, actions)
-    sampled05 = model05.sample_actions(obs, num_steps=5)
+    tok05 = Pi0Tokenizer(max_len=cfg05.max_token_len, pi05=True)
+    obs05 = build_observation(images, state, prompts, tok05)
+    loss05 = model05.compute_loss(obs05, actions)
+    sampled05 = model05.sample_actions(obs05, num_steps=5)
     print("[pi05] loss:", tuple(loss05.shape), "| sampled:", tuple(sampled05.shape))
 
-    print("OK: pi0-base forward/sample 동작 확인 완료")
+    print("OK: pi0-base forward/sample (+tokenizer) 동작 확인 완료")
