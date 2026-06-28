@@ -680,6 +680,7 @@ class VitEncoderBlock(nn.Module):
     shape 기호:  B=batch, P=패치(토큰) 수, vit_width=ViT width.
     x [B, P, vit_width] -> [B, P, vit_width] (차원 불변).
     """
+    
 
     def __init__(self, width: int, num_heads: int, mlp_dim: int):
         super().__init__()
