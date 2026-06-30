@@ -28,12 +28,14 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from module import *
 from VisionEncoder import SigLIP
 from Tokenizer import Pi05Tokenizer, Pi05Embedder
-from utils import posemb_sincos, make_attn_mask
+from utils import posemb_sincos, make_attn_mask, apply_rope, gated_residual
 
 # For ease debug, define DEBUG variable as global (0: no debug, 1~: debug print level)
 DEBUG = 1
+BIG_NEG = -2.3819763e38
 
 class PI05(nn.Module) :
     def __init__(self, config):
@@ -46,10 +48,15 @@ class PI05(nn.Module) :
         siglip_config = config["SigLIP"]
         action_config = config["ActionExpert"]
 
+        self.depth = int(model_config["depth"])
         self.vlm_width = int(vlm_config["width"])
         self.action_dim = int(action_config["action_dim"])
         self.action_hz = int(action_config["action_horizontal"])
         self.action_width = int(action_config["width"])
+
+        self.head_dim = int(model_config["head_dim"])
+        self.num_heads = int(model_config["num_heads"])
+        self.num_kv_heads = int(model_config["num_kv_heads"])
 
         # Vision Encoder (SigLIP) setup
         self.image_width, self.image_height = int(model_config["image_width"]), int(model_config["image_height"])
@@ -70,6 +77,26 @@ class PI05(nn.Module) :
         self.time_in = nn.Linear(self.action_width, self.action_width)
         self.time_out = nn.Linear(self.action_width, self.action_width)
 
+        # Action Expert Transformer Setup
+        self.action_attn_rms = nn.ModuleList(
+            [RMSNorm(self.action_width, self.action_width) for _ in range(self.depth)]
+        )
+        self.qkv_action = nn.ModuleDict({
+            "q" : nn.ModuleList([Linear(self.action_width, self.head_dim * self.num_heads, bias=False) for _ in range(self.depth)]),
+            "k" : nn.ModuleList([Linear(self.action_width, self.head_dim * self.num_kv_heads, bias=False) for _ in range(self.depth)]),
+            "v" : nn.ModuleList([Linear(self.action_width, self.head_dim * self.num_kv_heads, bias=False) for _ in range(self.depth)])
+        })
+        self.out_action = nn.ModuleList(
+            [Linear(self.head_dim * self.num_heads, self.action_width, bias=False) for _ in range(self.depth)]
+        )
+        self.action_mlp_rms = nn.ModuleList(
+            [RMSNorm(self.action_width, self.action_width) for _ in range(self.depth)]
+        )
+        self.action_mlp = nn.ModuleList(
+            [GemmaMLP(self.action_width, int(action_config["mlp_dim"])) for _ in range(self.depth)]
+        )
+        self.action_final_rms = RMSNorm(self.action_width, self.action_width)
+
         # VLM Setup (Tokenizer Involved)
         self.embedder = Pi05Embedder(
             int(vlm_config["vocab_size"]), 
@@ -86,6 +113,108 @@ class PI05(nn.Module) :
                 float(action_config["state_upperbound"]),
                 int(vlm_config["action_bin_size"])
             )
+        
+        # VLM Transformer Setup
+        self.vlm_attn_rms = nn.ModuleList(
+            [RMSNorm(self.vlm_width) for _ in range(self.depth)]
+        )
+        self.qkv_vlm = nn.ModuleDict({
+            "q" : nn.ModuleList([Linear(self.vlm_width, self.head_dim * self.num_heads, bias=False) for _ in range(self.depth)]),
+            "k" : nn.ModuleList([Linear(self.vlm_width, self.head_dim * self.num_kv_heads, bias=False) for _ in range(self.depth)]),
+            "v" : nn.ModuleList([Linear(self.vlm_width, self.head_dim * self.num_kv_heads, bias=False) for _ in range(self.depth)])
+        })
+        self.out_vlm = nn.ModuleList(
+            [Linear(self.head_dim * self.num_heads, self.vlm_width, bias=False) for _ in range(self.depth)]
+        )
+        self.vlm_mlp_rms = nn.ModuleList(
+            [RMSNorm(self.vlm_width) for _ in range(self.depth)]
+        )
+        self.vlm_mlp = nn.ModuleList(
+            [GemmaMLP(self.vlm_width, int(vlm_config["mlp_dim"])) for _ in range(self.depth)]
+        )
+        self.vlm_final_rms = RMSNorm(self.vlm_width)
+
+
+    def attention(self, query, key, value, mask, positions, kv_cache=None) :
+        # Reshape tensor (B, T, head_dim * [kv]num_heads) -> (B, T, [kv]num_heads, head_dim)
+        B, T, _ = query.shape
+        q = query.view(B, T, self.num_heads, self.head_dim)
+        k = key.view(B, T, self.num_kv_heads, self.head_dim)
+        v = value.view(B, T, self.num_kv_heads, self.head_dim)
+
+        # Apply RoPE (Rotary Positional Encoding for each token with position idx)
+        q = apply_rope(q, positions) * (self.head_dim**-0.5)
+        k = apply_rope(k, positions)
+
+        # Extend given KV cache if it exist (Use both VLM & ActionExpert - Inference step)
+        if kv_cache is not None:
+            k = torch.cat([kv_cache[0], k], dim=1)
+            v = torch.cat([kv_cache[1], v], dim=1)
+        new_kv_cache = (k, v)
+
+        # Repeat KV for GQA(Grouped Query Attention) to match num_kv_heads and num_head
+        if self.num_kv_heads != self.num_heads:
+            repeat_size = self.num_heads // self.num_kv_heads
+            k = k.repeat_interleave(repeat_size, dim=2)
+            v = v.repeat_interleave(repeat_size, dim=2)
+        
+        # Query, Key attention logits (float32 stabilization). b=batch, t=query, s=key, h=num_heads, d=head_dim
+        logits = torch.einsum("bthd,bshd->bhts", q.float(), k.float())
+
+        # Applying mask to attnetion logits
+        mask = mask[:, None, :, :] # Expand mask to broadcast each heads
+        logits = torch.where(mask, logits, torch.full_like(logits, BIG_NEG))
+        probs = torch.softmax(logits, dim=-1).to(v.dtype)
+
+        # Value matmul with attention logits to finalize calculation
+        encoded = torch.einsum("bhts,bshd->bthd", probs, v)
+        encoded = encoded.reshape(B, T, self.num_heads * self.head_dim)
+
+        return encoded, new_kv_cache
+    
+    def forward(self, prefix_tokens, suffix_tokens, attn_mask, positions, adarms_cond_emb, kv_caches=None):
+        # Initial setup
+        B = observation["state"].shape[0]
+        device = observation["state"].device
+        new_kv_caches = []
+        if not kv_caches :
+            kv_caches = [kv_caches] * self.depth
+
+        for i in range(self.depth) :
+            # Step 1. Adaptive RMS normalization with conditional vector (pre attention)
+            mod_prefix_tokens, gate_p = self.vlm_attn_rms[i](prefix_tokens)
+            mod_suffix_tokens, gate_s = self.action_attn_rms[i](suffix_tokens, adarms_cond_emb)
+
+            # Step 2. Shared Attention between VLM & ActionExpert
+            vlm_q, vlm_k, vlm_v = self.qkv_vlm["q"][i](mod_prefix_tokens), self.qkv_vlm["k"][i](mod_prefix_tokens), self.qkv_vlm["v"][i](mod_prefix_tokens)
+            action_q, action_k, action_v = self.qkv_action["q"][i](mod_suffix_tokens), self.qkv_action["k"][i](mod_suffix_tokens), self.qkv_action["v"][i](mod_suffix_tokens)
+            q, k, v = torch.cat([vlm_q, action_q], dim=1), torch.cat([vlm_k, action_k], dim=1), torch.cat([vlm_v, action_v], dim=1)
+            attn_out, new_kv_cache = self.attention(q, k ,v, attn_mask, positions, kv_caches[i])
+            new_kv_caches.append(new_kv_cache)
+            mod_prefix_tokens = self.out_vlm[i](attn_out[:, :mod_prefix_tokens.shape[1]])
+            mod_suffix_tokens = self.out_action[i](attn_out[:, mod_prefix_tokens.shape[1]:])
+
+            # Step 3. Gated Residual for each token
+            prefix_tokens = gated_residual(prefix_tokens, mod_prefix_tokens, gate_p)
+            suffix_tokens = gated_residual(suffix_tokens, mod_suffix_tokens, gate_s)
+
+            # Step 4. Adaptive RMS normalization with conditional vector (pre MLP)
+            mod_prefix_tokens, gate_p = self.vlm_mlp_rms[i](prefix_tokens)
+            mod_suffix_tokens, gate_s = self.action_mlp_rms[i](suffix_tokens, adarms_cond_emb)
+
+            # Step 5. Private MLP for each expert (VLM / ActionExpert)
+            mod_prefix_tokens = self.vlm_mlp[i](mod_prefix_tokens)
+            mod_suffix_tokens = self.action_mlp[i](mod_suffix_tokens)
+
+            # Step6. Gated Residual for each token
+            prefix_tokens = gated_residual(prefix_tokens, mod_prefix_tokens, gate_p)
+            suffix_tokens = gated_residual(suffix_tokens, mod_suffix_tokens, gate_s)
+        
+        # Final RMS Normalization layer and cache output
+        prefix_tokens = self.vlm_final_rms(prefix_tokens)[0]
+        suffix_tokens = self.action_final_rms(suffix_tokens, adarms_cond_emb)[0]
+
+        return prefix_tokens, suffix_tokens, new_kv_caches
 
     def embed_prefix(self, observation):
         """
@@ -166,7 +295,6 @@ class PI05(nn.Module) :
         adarms_cond_emb = F.silu(self.time_out(adarms_cond_emb))
         if DEBUG >= 2 : 
             print(f"Time Embedding: {time_emb}")
-            print(f"RMS time conditional vector : {adarms_cond_emb}")
 
         # Action Encoding
         tokens.append(self.action_in(actions))
@@ -186,16 +314,9 @@ class PI05(nn.Module) :
             if DEBUG >= 2 : print(f"       - specification : {pad_masks}") 
             print(f"    - auto-regressive orthogonal mask pad : {ar_mask.shape}")
             if DEBUG >= 2 : print(f"       - specification : {ar_mask}")
+            print(f"    - Adaptive RMS Conditional embedding vector : {adarms_cond_emb.shape}")
+            if DEBUG >= 2 : print(f"       - specification : {adarms_cond_emb}")
         return tokens, pad_masks, ar_mask, adarms_cond_emb
-
-    def forward(self, prefix_tokens, suffix_tokens, attn_mask, positions, adarms_cond_emb):
-        # Initial setup
-        B = observation["state"].shape[0]
-        device = observation["state"].device
-
-
-
-        return
     
     def pi05_train(self, observation, actions, only_flows=False) :
         # Initial setup
@@ -227,7 +348,7 @@ class PI05(nn.Module) :
             print(f"[INFO] Embedding positions for RoPE : {positions}")
 
         # Stage 2. Expert Transformer (Shared Attention)
-        prefix_out, suffix_out = self(prefix_tok, suffix_tok, attn_mask, positions, adarms_cond_emb)
+        prefix_out, suffix_out, kv_caches = self(prefix_tok, suffix_tok, attn_mask, positions, adarms_cond_emb)
         v_t = self.action_out(suffix_out)
 
         if only_flows :
