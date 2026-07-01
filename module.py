@@ -25,6 +25,8 @@ class GemmaMLP(nn.Module):
         self.down_proj = nn.Linear(hidden_dim, width, bias=False)  # mlp -> width
 
     def forward(self, x: Tensor) -> Tensor:
+        if x is None :
+            return None
         # gate_proj(x)[B,T,mlp] --gelu--> [B,T,mlp] ; up_proj(x)[B,T,mlp] ; 둘을 곱 [B,T,mlp]
         # --down_proj--> [B,T,width]   (x[B,T,width] -> ... -> [B,T,width])
         return self.down_proj(F.gelu(self.gate_proj(x), approximate="tanh") * self.up_proj(x))
@@ -54,6 +56,9 @@ class RMSNorm(nn.Module):
             self.scale = nn.Parameter(torch.zeros(dim))  # [dim], (1 + scale) 형태로 사용
 
     def forward(self, x: Tensor, cond: Optional[Tensor] = None):
+        # Optional input handling in pi0.5
+        if x is None:
+            return None, None
         # x: [B, T, dim]
         dtype = x.dtype
         var = x.float().pow(2).mean(dim=-1, keepdim=True)  # [B, T, 1]

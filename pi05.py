@@ -31,10 +31,10 @@ from torch import Tensor, nn
 from module import *
 from VisionEncoder import SigLIP
 from Tokenizer import Pi05Tokenizer, Pi05Embedder
-from utils import posemb_sincos, make_attn_mask, apply_rope, gated_residual
+from utils import posemb_sincos, make_attn_mask, apply_rope, gated_residual, optional_cat
 
 # For ease debug, define DEBUG variable as global (0: no debug, 1~: debug print level)
-DEBUG = 1
+DEBUG = 3
 BIG_NEG = -2.3819763e38
 
 class PI05(nn.Module) :
@@ -134,7 +134,6 @@ class PI05(nn.Module) :
         )
         self.vlm_final_rms = RMSNorm(self.vlm_width)
 
-
     def attention(self, query, key, value, mask, positions, kv_cache=None) :
         # Reshape tensor (B, T, head_dim * [kv]num_heads) -> (B, T, [kv]num_heads, head_dim)
         B, T, _ = query.shape
@@ -172,7 +171,7 @@ class PI05(nn.Module) :
 
         return encoded, new_kv_cache
     
-    def forward(self, prefix_tokens, suffix_tokens, attn_mask, positions, adarms_cond_emb, kv_caches=None):
+    def forward(self, prefix_tokens, suffix_tokens, attn_mask, positions, adarms_cond_emb=None, kv_caches=None):
         # Initial setup
         B = observation["state"].shape[0]
         device = observation["state"].device
@@ -180,54 +179,67 @@ class PI05(nn.Module) :
         if not kv_caches :
             kv_caches = [kv_caches] * self.depth
 
+        if DEBUG >= 1 : print("[INFO] Transformer forward with given Prefix/Suffix tokens")
         for i in range(self.depth) :
             # Step 1. Adaptive RMS normalization with conditional vector (pre attention)
+            if DEBUG >= 2 : print("=" * 30 + f" {i + 1}-th Step " + "=" * 30)
             mod_prefix_tokens, gate_p = self.vlm_attn_rms[i](prefix_tokens)
             mod_suffix_tokens, gate_s = self.action_attn_rms[i](suffix_tokens, adarms_cond_emb)
+            if DEBUG >= 2 : print(f" - Prefix/Suffix Tokens shape after RMSNorm (Pre Attention) : {mod_prefix_tokens.shape if mod_prefix_tokens is not None else None} / {mod_suffix_tokens.shape if mod_suffix_tokens is not None else None}")
 
             # Step 2. Shared Attention between VLM & ActionExpert
-            vlm_q, vlm_k, vlm_v = self.qkv_vlm["q"][i](mod_prefix_tokens), self.qkv_vlm["k"][i](mod_prefix_tokens), self.qkv_vlm["v"][i](mod_prefix_tokens)
-            action_q, action_k, action_v = self.qkv_action["q"][i](mod_suffix_tokens), self.qkv_action["k"][i](mod_suffix_tokens), self.qkv_action["v"][i](mod_suffix_tokens)
-            q, k, v = torch.cat([vlm_q, action_q], dim=1), torch.cat([vlm_k, action_k], dim=1), torch.cat([vlm_v, action_v], dim=1)
+            q = optional_cat(self.qkv_vlm["q"][i](mod_prefix_tokens), self.qkv_action["q"][i](mod_suffix_tokens), dim=1)
+            k = optional_cat(self.qkv_vlm["k"][i](mod_prefix_tokens), self.qkv_action["k"][i](mod_suffix_tokens), dim=1)
+            v = optional_cat(self.qkv_vlm["v"][i](mod_prefix_tokens), self.qkv_action["v"][i](mod_suffix_tokens), dim=1)
+            if DEBUG >= 2 : 
+                print(f" - Query, Key, Value shape before attention : Q({q.shape}), K({k.shape}), V({v.shape})")
+                if DEBUG >= 3 : 
+                    print(f"    - Query True value : {q}")
+                    print(f"    - Key True value : {k}")
+                    print(f"    - Value True value : {v}")
             attn_out, new_kv_cache = self.attention(q, k ,v, attn_mask, positions, kv_caches[i])
             new_kv_caches.append(new_kv_cache)
-            mod_prefix_tokens = self.out_vlm[i](attn_out[:, :mod_prefix_tokens.shape[1]])
-            mod_suffix_tokens = self.out_action[i](attn_out[:, mod_prefix_tokens.shape[1]:])
+            bifurcation = mod_prefix_tokens.shape[1] if mod_prefix_tokens is not None else 0
+            mod_prefix_tokens = self.out_vlm[i](attn_out[:, :bifurcation] if mod_prefix_tokens is not None else None)
+            mod_suffix_tokens = self.out_action[i](attn_out[:, bifurcation : bifurcation + mod_suffix_tokens.shape[1]] if mod_suffix_tokens is not None else None)
+            if DEBUG >= 2 : 
+                print(f" - Prefix/Suffix Tokens shape after Attention : {mod_prefix_tokens.shape if mod_prefix_tokens is not None else None} / {mod_suffix_tokens.shape if mod_suffix_tokens is not None else None}")
+                print(f" - New KV Cache shape from Attention : Cache K({new_kv_cache[0].shape}), Cache V({new_kv_cache[1].shape})")
 
             # Step 3. Gated Residual for each token
             prefix_tokens = gated_residual(prefix_tokens, mod_prefix_tokens, gate_p)
             suffix_tokens = gated_residual(suffix_tokens, mod_suffix_tokens, gate_s)
+            if DEBUG >= 2 : print(f" - Prefix/Suffix Tokens shape after Residual : {prefix_tokens.shape if prefix_tokens is not None else None} / {suffix_tokens.shape if suffix_tokens is not None else None}")
 
             # Step 4. Adaptive RMS normalization with conditional vector (pre MLP)
             mod_prefix_tokens, gate_p = self.vlm_mlp_rms[i](prefix_tokens)
             mod_suffix_tokens, gate_s = self.action_mlp_rms[i](suffix_tokens, adarms_cond_emb)
+            if DEBUG >= 2 : print(f" - Prefix/Suffix Tokens shape after RMSNorm (Pre MLP) : {mod_prefix_tokens.shape if mod_prefix_tokens is not None else None} / {mod_suffix_tokens.shape if mod_suffix_tokens is not None else None}")
 
             # Step 5. Private MLP for each expert (VLM / ActionExpert)
             mod_prefix_tokens = self.vlm_mlp[i](mod_prefix_tokens)
             mod_suffix_tokens = self.action_mlp[i](mod_suffix_tokens)
+            if DEBUG >= 2 : print(f" - Prefix/Suffix Tokens shape after MLP : {mod_prefix_tokens.shape if mod_prefix_tokens is not None else None} / {mod_suffix_tokens.shape if mod_suffix_tokens is not None else None}")
 
             # Step6. Gated Residual for each token
             prefix_tokens = gated_residual(prefix_tokens, mod_prefix_tokens, gate_p)
             suffix_tokens = gated_residual(suffix_tokens, mod_suffix_tokens, gate_s)
-        
+            if DEBUG >= 2 : print(f" - Prefix/Suffix Tokens shape after Residual : {prefix_tokens.shape if prefix_tokens is not None else None} / {suffix_tokens.shape if suffix_tokens is not None else None}")
+        if DEBUG >= 2 : print("=" * 72)
+
         # Final RMS Normalization layer and cache output
         prefix_tokens = self.vlm_final_rms(prefix_tokens)[0]
         suffix_tokens = self.action_final_rms(suffix_tokens, adarms_cond_emb)[0]
+        if DEBUG >= 1:
+            print(f"[INFO] Transformer Finished, result summary: ")
+            print(f"  - Final prefix token shape : {prefix_tokens.shape if prefix_tokens is not None else None}")
+            print(f"  - Final suffix token shape : {suffix_tokens.shape if suffix_tokens is not None else None}")
+            print(f"  - Newly generated KV Cache shape : {len(new_kv_caches)} x [{new_kv_caches[0][0].shape}, {new_kv_caches[0][1].shape}] ")
+            print(f"  - Conditional Embedding shape : {adarms_cond_emb.shape if adarms_cond_emb is not None else None}")
 
         return prefix_tokens, suffix_tokens, new_kv_caches
 
-    def embed_prefix(self, observation):
-        """
-        Core Variables:
-         - tokens : suffix tokens
-         - pad_masks: padding mask related to input settings
-         - ar_mask: auto-regressinve mask to make boarder for block attention
-
-        Input conf.
-
-        Output conf.
-
-        """
+    def embed_prefix(self, observation, device):
         tokens, pad_masks, ar_mask = [], [], []
 
         # Image Encoding
@@ -261,9 +273,9 @@ class PI05(nn.Module) :
         task_state_length = tokens[-1].shape[1]
 
         # Concat for "list -> torch.Tensor" converstion
-        tokens = torch.cat(tokens, dim=1)
-        pad_masks = torch.cat(pad_masks, dim=1)
-        ar_mask = torch.tensor(ar_mask, dtype=torch.bool)
+        tokens = torch.cat(tokens, dim=1).to(device)
+        pad_masks = torch.cat(pad_masks, dim=1).to(device)
+        ar_mask = torch.tensor(ar_mask, dtype=torch.bool).to(device)
 
         if DEBUG >= 1 : 
             print(f"[INFO] Final Prefix encoding result: ")
@@ -275,18 +287,7 @@ class PI05(nn.Module) :
             if DEBUG >= 2 : print(f"       - specification : {ar_mask}") 
         return tokens, pad_masks, ar_mask
     
-    def embed_suffix(self, actions, timestep) :
-        """
-        Core Variables:
-         - tokens : suffix tokens
-         - pad_masks: padding mask related to input settings
-         - ar_mask: auto-regressinve mask to make boarder for block attention
-
-        Input conf.
-
-        Output conf.
-
-        """
+    def embed_suffix(self, actions, timestep, device) :
         tokens, pad_masks, ar_mask = [], [], []
 
         # Time Embedding -> Condition Vector for RMSNorm
@@ -302,9 +303,9 @@ class PI05(nn.Module) :
         ar_mask += [1] + [0] * (self.action_hz - 1)
         
         # Concat for "list -> torch.Tensor" converstion
-        tokens = torch.cat(tokens, dim=1)
-        pad_masks = torch.cat(pad_masks, dim=1)
-        ar_mask = torch.tensor(ar_mask, dtype=torch.bool)
+        tokens = torch.cat(tokens, dim=1).to(device)
+        pad_masks = torch.cat(pad_masks, dim=1).to(device)
+        ar_mask = torch.tensor(ar_mask, dtype=torch.bool).to(device)
 
         if DEBUG >= 1 : 
             print(f"[INFO] Final Suffix encoding result: ")
@@ -318,11 +319,11 @@ class PI05(nn.Module) :
             if DEBUG >= 2 : print(f"       - specification : {adarms_cond_emb}")
         return tokens, pad_masks, ar_mask, adarms_cond_emb
     
-    def pi05_train(self, observation, actions, only_flows=False) :
+    def pi05_whole(self, observation, actions, only_flows=False) :
         # Initial setup
         B = observation["state"].shape[0]
         device = observation["state"].device
-        assert actions != None, "Training requires ground true actions"
+        assert actions != None, "Ture action is required for smoke test"
         observation = observation_preprocess(observation)
 
         # Training sample augmentation
@@ -334,8 +335,8 @@ class PI05(nn.Module) :
         u_t = noise - actions # True flow for x_t
 
         # Stage 1. Token Embeddings
-        prefix_tok, prefix_pad, prefix_ar = self.embed_prefix(observation)
-        suffix_tok, suffix_pad, suffix_ar, adarms_cond_emb = self.embed_suffix(x_t, time)
+        prefix_tok, prefix_pad, prefix_ar = self.embed_prefix(observation, device)
+        suffix_tok, suffix_pad, suffix_ar, adarms_cond_emb = self.embed_suffix(x_t, time, device)
 
         # Concatenate pad, auto-regressive mask and generate final Attention Mask
         pad_mask = torch.cat([prefix_pad, suffix_pad], dim=1)
@@ -356,13 +357,43 @@ class PI05(nn.Module) :
         else :
             return F.mse_loss(v_t, u_t, reduction="none")
     
-    def pi05_inference(self, observation, actions=None) :
+    def pi05_split(self, observation, actions) :
         # Initial setup
         B = observation["state"].shape[0]
         device = observation["state"].device
-        if actions != None :
-            print("[WARN] Given actions will be used as initial noise")
-            if DEBUG >= 2 : print("Actions: ", actions)
+        assert actions != None, "Ture action is required for smoke test"
+        observation = observation_preprocess(observation)
+
+         # Training sample augmentation
+        noise = torch.randn_like(actions)
+        time = torch.distributions.Beta(1.5, 1.0).sample((B,)).to(device) * 0.999 + 0.001
+
+        t = time[:, None, None] # Broadcasted current timestep
+        x_t = noise * t + (1.0 - t) * actions # Noise mixed sample
+        u_t = noise - actions # True flow for x_t
+
+         # Stage 1. Token Embeddings
+        prefix_tok, prefix_pad, prefix_ar = self.embed_prefix(observation, device)
+        suffix_tok, suffix_pad, suffix_ar, adarms_cond_emb = self.embed_suffix(x_t, time, device)
+
+        # Generate each prefix, suffix tokens attention mask
+        prefix_attn_mask = make_attn_mask(prefix_pad, prefix_ar)
+        prefix_positions = torch.cumsum(prefix_pad.int(), dim=1) - 1
+
+        suffix_attn_mask = make_attn_mask(suffix_pad, suffix_ar)
+        prefix_extended_mask = prefix_pad[:, None, :].expand(B, suffix_pad.shape[1], prefix_pad.shape[1])
+        suffix_full_mask = torch.cat([suffix_attn_mask, prefix_extended_mask], dim=2)
+        suffix_positions = prefix_positions[:, -1] + torch.cumsum(suffix_pad.int(), dim=1) - 1
+
+        # Stage 2. VLM Transformer (Get KV cache) and Action Expert Transformer (Denoising)
+        prefix_out, _, kv_caches = self(prefix_tok, None, prefix_attn_mask, prefix_positions)
+        _, suffix_out, _ = self(None, suffix_tok, suffix_full_mask, suffix_positions, adarms_cond_emb, kv_caches)
+
+        #Summary Result
+        if DEBUG >= 1 : 
+            print(f"[INFO] prefix, suffix split transformer forward result")
+            print(f"  - prefix output shape : {prefix_out.shape}")
+            print(f"  - suffix output shape : {suffix_out.shape}")
 
         return
 
@@ -382,30 +413,32 @@ def observation_preprocess(observation) :
 
 if __name__ == "__main__":
     ### PI05 EXAMPLE TEST ###
+    device = "cuda"
     state_lowerbound, state_upperbound = -1.0, 1.0
     observation = {
-        "images": [torch.randn(1, 3, 224, 224), torch.randn(1, 3, 224, 224), torch.randn(1, 3, 224, 224)],
-        "images_mask": [torch.ones(1, dtype=torch.bool), torch.ones(1, dtype=torch.bool), torch.ones(1, dtype=torch.bool)],
+        "images": [torch.randn(1, 3, 224, 224).to(device), torch.randn(1, 3, 224, 224).to(device), torch.randn(1, 3, 224, 224).to(device)],
+        "images_mask": [torch.ones(1, dtype=torch.bool).to(device), torch.ones(1, dtype=torch.bool).to(device), torch.ones(1, dtype=torch.bool).to(device)],
         "task": ["Put the dish on the table"],
-        "state": torch.empty(1, 32).uniform_(state_lowerbound, state_upperbound)
+        "state": torch.empty(1, 32).uniform_(state_lowerbound, state_upperbound).to(device)
     }
     observation_preprocessed = {
-        "images": [torch.randn(1, 3, 224, 224), torch.randn(1, 3, 224, 224), torch.randn(1, 3, 224, 224)],
-        "images_mask": [torch.ones(1, dtype=torch.bool), torch.ones(1, dtype=torch.bool), torch.ones(1, dtype=torch.bool)],
-        "tokens": torch.randint(1, 257152, (1, 200)),
-        "tokens_mask": torch.ones(1, 200, dtype=torch.bool)
+        "images": [torch.randn(1, 3, 224, 224).to(device), torch.randn(1, 3, 224, 224).to(device), torch.randn(1, 3, 224, 224).to(device)],
+        "images_mask": [torch.ones(1, dtype=torch.bool).to(device), torch.ones(1, dtype=torch.bool).to(device), torch.ones(1, dtype=torch.bool).to(device)],
+        "tokens": torch.randint(1, 257152, (1, 200)).to(device),
+        "tokens_mask": torch.ones(1, 200, dtype=torch.bool).to(device)
     }
-    true_actions = torch.empty(1, 50, 32).uniform_(state_lowerbound, state_upperbound)
+    true_actions = torch.empty(1, 50, 32).uniform_(state_lowerbound, state_upperbound).to(device)
 
     # Model setup
     config = configparser.ConfigParser()
     config.read("./config.cfg")
-    model = PI05(config)
+    model = PI05(config).to(device)
 
-    # Model basic test
-    # model(observation, true_actions)
+    # Model whole token test
+    if DEBUG >= 1 : print("================== Whole Token Smoke Test ==================")
+    model.pi05_whole(observation, true_actions)
 
-    # Model training test
-    model.pi05_train(observation, true_actions)
-
-    # Model inference test
+    # Model split token test
+    if DEBUG >= 1 : print("================== Split Token Smoke Test ==================")
+    model.pi05_split(observation, true_actions)
+    

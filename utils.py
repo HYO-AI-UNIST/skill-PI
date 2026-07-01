@@ -77,3 +77,11 @@ def gated_residual(x, y, gate):
   if gate is None:
       return x + y  # 일반 residual
   return x + y * gate  # adaRMS gated residual
+
+def optional_cat(a : Tensor, b : Tensor, dim: int) :
+   if a is None :
+      return b
+   elif b is None :
+      return a
+   else :
+      return torch.cat([a, b], dim=dim)
