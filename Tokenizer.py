@@ -58,42 +58,123 @@ class Pi05Embedder(nn.Module):
 
 
 class Pi05Tokenizer(nn.Module):
-    def __init__(self, prompt_length, sp_model_path, state_low = -1.0, state_up = 1.0, bin_size = 256) :
+    def __init__(self, prompt_length, sp_model_path, state_low=-1.0, state_up=1.0, bin_size=256):
         super().__init__()
         self.max_len = prompt_length
+        self.state_low = state_low
+        self.state_up = state_up
+        self.bin_size = bin_size
         self.discrete_bins = np.linspace(state_low, state_up, bin_size + 1)[:-1]
 
-        # Loading PaliGemma Tokenizer
-        sp = sentencepiece.SentencePieceProcessor(model_file=sp_model_path)
-        self._encode = lambda s, add_bos=False: sp.encode(s, add_bos=add_bos)
-    
-    def forward(self, raw_task : list[str], raw_state: torch.Tensor) :
+        # Keep the SentencePiece processor so generation can access ids/decode.
+        self.sp = sentencepiece.SentencePieceProcessor(model_file=sp_model_path)
+        self.pad_id = self._safe_special_id(self.sp.pad_id(), 0)
+        self.eos_id = self._safe_special_id(self.sp.eos_id(), 1)
+        self.bos_id = self._safe_special_id(self.sp.bos_id(), 2)
+        self.unk_id = self._safe_special_id(self.sp.unk_id(), 3)
+
+    @staticmethod
+    def _safe_special_id(value: int, fallback: int) -> int:
+        return fallback if value is None or value < 0 else int(value)
+
+    def encode_text(self, text: str, *, add_bos: bool = False, add_eos: bool = False) -> list[int]:
+        return list(self.sp.encode(text, add_bos=add_bos, add_eos=add_eos))
+
+    def decode(self, generated_tokens: list[int] | torch.Tensor, *, skip_special_tokens: bool = True) -> str:
+        if isinstance(generated_tokens, torch.Tensor):
+            token_ids = generated_tokens.detach().cpu().view(-1).tolist()
+        else:
+            token_ids = [int(token) for token in generated_tokens]
+
+        if skip_special_tokens:
+            special_ids = {self.pad_id, self.bos_id, self.eos_id}
+            token_ids = [token for token in token_ids if token not in special_ids]
+        return self.sp.decode(token_ids)
+
+    def _state_to_text(self, state: np.ndarray) -> str:
+        state = np.clip(state, self.state_low, self.state_up)
+        discretized_state = np.digitize(state, self.discrete_bins) - 1
+        discretized_state = np.clip(discretized_state, 0, self.bin_size - 1)
+        return " ".join(map(str, discretized_state.tolist()))
+
+    @staticmethod
+    def _clean_task(task: str) -> str:
+        return task.strip().replace("_", " ").replace("\n", " ")
+
+    def build_prompt(self, raw_task: str, raw_state: torch.Tensor | np.ndarray, *, response_key: str = "Action") -> str:
+        if isinstance(raw_state, torch.Tensor):
+            state = raw_state.detach().cpu().numpy()
+        else:
+            state = np.asarray(raw_state)
+        task_str = self._clean_task(raw_task)
+        state_str = self._state_to_text(state)
+        return f"Task: {task_str}, State: {state_str};\n{response_key}: "
+
+    def encode(
+        self,
+        raw_task: list[str] | str,
+        raw_state: torch.Tensor | None = None,
+        *,
+        response_key: str = "Action",
+        add_bos: bool = True,
+        add_eos: bool = False,
+        max_len: int | None = None,
+        pad: bool = True,
+        device: torch.device | str | None = None,
+    ):
+        """Encode either PI05 prompts or plain text.
+
+        If raw_state is provided, raw_task is interpreted as task text and a full
+        PI05 prompt is built: "Task: ..., State: ...;\n<Response>: ". This is the
+        path used by PI05.embed_prefix.
+
+        If raw_state is None, raw_task is encoded as plain text. This is useful
+        for subtask targets, usually with add_eos=True.
+        """
+        if raw_state is None:
+            text = raw_task if isinstance(raw_task, str) else raw_task[0]
+            return self.encode_text(text, add_bos=add_bos, add_eos=add_eos)
+
+        tasks = [raw_task] if isinstance(raw_task, str) else list(raw_task)
+        length = self.max_len if max_len is None else max_len
+        out_device = raw_state.device if device is None and isinstance(raw_state, torch.Tensor) else device
+
         tokenized_prompt, prompt_pad_mask = [], []
+        for i, task in enumerate(tasks):
+            state_i = raw_state[i] if isinstance(raw_state, torch.Tensor) and raw_state.ndim > 1 else raw_state
+            full_prompt = self.build_prompt(task, state_i, response_key=response_key)
+            tokens = self.encode_text(full_prompt, add_bos=add_bos, add_eos=add_eos)
 
-        for i in range(raw_state.shape[0]) :
-            # Continuous value to discritize value state conversion
-            state = raw_state[i].detach().cpu().numpy()
-            discretized_state = np.digitize(state, self.discrete_bins) - 1
-            state_str = " ".join(map(str, discretized_state.tolist()))
+            if len(tokens) > length:
+                raise ValueError(
+                    f"{i} sample with prompt '{full_prompt}' exceeds max token length "
+                    f"({len(tokens)} > {length})"
+                )
 
-            # polish task prompt and generate final prompt
-            task_str = raw_task[i].strip().replace("_", " ").replace("\n", " ")
-            full_prompt = f"Task: {task_str}, State: {state_str};\nAction: "
-            tokens = self._encode(full_prompt, add_bos=True)
+            if pad:
+                mask = [True] * len(tokens) + [False] * (length - len(tokens))
+                tokens = tokens + [self.pad_id] * (length - len(tokens))
+            else:
+                mask = [True] * len(tokens)
 
-            # Build mask for prompt based on max_len
-            assert len(tokens) <= self.max_len, f"{i} sample with prompt '{full_prompt}' overs the max length of input ({self.max_len})"
-            if len(tokens) < self.max_len :
-                mask = [True] * len(tokens) + [False] * (self.max_len - len(tokens))
-                tokens += [0] * (self.max_len - len(tokens))
-            else :
-                mask = [True] * self.max_len
-
-            # Add current mask, tokens to the final output
             tokenized_prompt.append(np.asarray(tokens, dtype=np.int64))
             prompt_pad_mask.append(np.asarray(mask, dtype=bool))
-        
-        # Convert Numpy to Pytorch tensor and return
-        # As you notice, this process becomes more efficient if it is done before model training/inferrence
-        # For practical purpose, please preprocess the dataset to use it as a tokenized one
-        return torch.as_tensor(np.stack(tokenized_prompt), device=raw_state.device), torch.as_tensor(np.stack(prompt_pad_mask), device=raw_state.device)
+
+        return (
+            torch.as_tensor(np.stack(tokenized_prompt), device=out_device),
+            torch.as_tensor(np.stack(prompt_pad_mask), device=out_device),
+        )
+
+    def encode_subtask_target(self, subtask: list[str] | str, *, device=None, max_len: int | None = None):
+        subtasks = [subtask] if isinstance(subtask, str) else list(subtask)
+        encoded = [self.encode_text(text, add_bos=False, add_eos=True) for text in subtasks]
+        length = max(len(tokens) for tokens in encoded) if max_len is None else max_len
+
+        tokenized, mask = [], []
+        for i, tokens in enumerate(encoded):
+            if len(tokens) > length:
+                raise ValueError(f"{i} subtask target exceeds max length ({len(tokens)} > {length})")
+            tokenized.append(np.asarray(tokens + [self.pad_id] * (length - len(tokens)), dtype=np.int64))
+            mask.append(np.asarray([True] * len(tokens) + [False] * (length - len(tokens)), dtype=bool))
+        return torch.as_tensor(np.stack(tokenized), device=device), torch.as_tensor(np.stack(mask), device=device)
+

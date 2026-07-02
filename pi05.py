@@ -34,7 +34,7 @@ from Tokenizer import Pi05Tokenizer, Pi05Embedder
 from utils import posemb_sincos, make_attn_mask, apply_rope, gated_residual, optional_cat
 
 # For ease debug, define DEBUG variable as global (0: no debug, 1~: debug print level)
-DEBUG = 3
+DEBUG = 1
 BIG_NEG = -2.3819763e38
 
 class PI05(nn.Module) :
@@ -98,6 +98,7 @@ class PI05(nn.Module) :
         self.action_final_rms = RMSNorm(self.action_width, self.action_width)
 
         # VLM Setup (Tokenizer Involved)
+        self.subtask_length = int(vlm_config["max_subtask_len"])
         self.embedder = Pi05Embedder(
             int(vlm_config["vocab_size"]), 
             self.vlm_width,
@@ -113,6 +114,7 @@ class PI05(nn.Module) :
                 float(action_config["state_upperbound"]),
                 int(vlm_config["action_bin_size"])
             )
+        self.lm_head = nn.Linear(self.vlm_width, int(vlm_config["vocab_size"]), bias=False)
         
         # VLM Transformer Setup
         self.vlm_attn_rms = nn.ModuleList(
@@ -173,8 +175,6 @@ class PI05(nn.Module) :
     
     def forward(self, prefix_tokens, suffix_tokens, attn_mask, positions, adarms_cond_emb=None, kv_caches=None):
         # Initial setup
-        B = observation["state"].shape[0]
-        device = observation["state"].device
         new_kv_caches = []
         if not kv_caches :
             kv_caches = [kv_caches] * self.depth
@@ -266,7 +266,7 @@ class PI05(nn.Module) :
             if DEBUG >= 2 : 
                 print(f"Input Task : '{observation["task"]}'")
                 print(f"Input State : {observation["state"]}")
-            tokenized_prompt, prompt_pad_mask = self.tokenizer(observation["task"], observation["state"])
+            tokenized_prompt, prompt_pad_mask = self.tokenizer.encode(observation["task"], observation["state"])
             tokens.append(self.embedder(tokenized_prompt) * math.sqrt(self.vlm_width))
             pad_masks.append(prompt_pad_mask)
             ar_mask += [0] * tokenized_prompt.shape[1]
@@ -318,6 +318,41 @@ class PI05(nn.Module) :
             print(f"    - Adaptive RMS Conditional embedding vector : {adarms_cond_emb.shape}")
             if DEBUG >= 2 : print(f"       - specification : {adarms_cond_emb}")
         return tokens, pad_masks, ar_mask, adarms_cond_emb
+
+    def subtask_generation(self, observation) :
+        # Stage 1. Observation Token Embeddings (Prefix only)
+        prefix_tok, prefix_pad, prefix_ar = self.embed_prefix(observation, device)
+
+        # Stage 2. Subtask auto-regressive generation for each token
+        generated_ids = []
+        kv_caches = None
+
+        for step in range(self.subtask_length):
+            if step == 0:
+                tokens = prefix_tok
+                pad = prefix_pad
+                ar = prefix_ar
+            else:
+                token_ids = torch.tensor([[generated_ids[-1]]], device=device)
+                token_emb = self.embedder(token_ids) * math.sqrt(self.vlm_width)
+
+                tokens = token_emb
+                pad = torch.ones(1, 1, dtype=torch.bool, device=device)
+                ar = torch.ones(1, dtype=torch.bool, device=device)  # causal text step
+
+            attn_mask = make_attn_mask(pad, ar)
+            positions = torch.cumsum(pad.int(), dim=1) - 1
+
+            prefix_out, _, kv_caches = self(tokens, None, attn_mask, positions, None, kv_caches)
+
+            logits = model.lm_head(prefix_out[:, -1])
+            next_id = int(torch.argmax(logits, dim=-1).item())
+
+            if next_id in {1}:
+                break
+            generated_ids.append(next_id)
+
+        return self.tokenizer.decode(generated_ids)
     
     def pi05_whole(self, observation, actions, only_flows=False) :
         # Initial setup
@@ -382,8 +417,8 @@ class PI05(nn.Module) :
 
         suffix_attn_mask = make_attn_mask(suffix_pad, suffix_ar)
         prefix_extended_mask = prefix_pad[:, None, :].expand(B, suffix_pad.shape[1], prefix_pad.shape[1])
-        suffix_full_mask = torch.cat([suffix_attn_mask, prefix_extended_mask], dim=2)
-        suffix_positions = prefix_positions[:, -1] + torch.cumsum(suffix_pad.int(), dim=1) - 1
+        suffix_full_mask = torch.cat([prefix_extended_mask, suffix_attn_mask], dim=2)
+        suffix_positions = prefix_positions[:, -1:] + torch.cumsum(suffix_pad.int(), dim=1)
 
         # Stage 2. VLM Transformer (Get KV cache) and Action Expert Transformer (Denoising)
         prefix_out, _, kv_caches = self(prefix_tok, None, prefix_attn_mask, prefix_positions)
@@ -395,7 +430,7 @@ class PI05(nn.Module) :
             print(f"  - prefix output shape : {prefix_out.shape}")
             print(f"  - suffix output shape : {suffix_out.shape}")
 
-        return
+        return prefix_out, suffix_out
 
     @staticmethod
     def summary_cfg(config):
@@ -441,4 +476,9 @@ if __name__ == "__main__":
     # Model split token test
     if DEBUG >= 1 : print("================== Split Token Smoke Test ==================")
     model.pi05_split(observation, true_actions)
+
+    # Model Subtask generation test
+    if DEBUG >= 1 : print("================== Subtask Generation Smoke Test ==================")
+    subtask = model.subtask_generation(observation)
+    if DEBUG >=1 : print(f"Generated Subtask : {subtask}")
     
